@@ -12,17 +12,44 @@ This script will:
 I'll keep this intentionally simple — we log content and save it for further processing or modification later.
 """
 
+from __future__ import annotations
+
 import re
 import json
 import time
+import sqlite3
+from contextlib import closing
+import os
 from typing import Optional
 
-from mitmproxy import ctx, http
+try:
+    from mitmproxy import ctx
+except Exception:
+    # Allow importing this module in environments without mitmproxy (tests, runners)
+    class _DummyLog:
+        def info(self, *a, **k):
+            print("INFO:", *a)
+        def warn(self, *a, **k):
+            print("WARN:", *a)
+        def error(self, *a, **k):
+            print("ERROR:", *a)
+
+    class _DummyCtx:
+        log = _DummyLog()
+
+    ctx = _DummyCtx()
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+	# type-only import so runtime doesn't require mitmproxy
+	from mitmproxy import http  # pragma: no cover
 
 
 SEARCH_ENDPOINT_RE = re.compile(r"^/i/api/graphql/[^/]+/SearchTimeline(?:\b|\?)")
 OUTFILE = "mitm_twitter_search_intercepts.jsonl"
-OUTFILE_EXTRACTED = "mitm_twitter_search_extracted.jsonl"
+# NOTE: extracted data is persisted into sqlite only; no JSONL extracted file maintained
+OUTFILE_DB = "mitm_twitter_search.db"
 
 
 def _safe_decode(b: Optional[bytes]) -> Optional[str]:
@@ -45,8 +72,16 @@ class TwitterSearchInterceptor:
 	"""
 
 	def __init__(self) -> None:
-		self.outfile = OUTFILE
-		self.outfile_extracted = OUTFILE_EXTRACTED
+		# use script directory so files are written to the repo folder predictably
+		base = os.path.dirname(__file__)
+		self.outfile = os.path.join(base, OUTFILE)
+		# no extracted JSONL produced any more; data is persisted to sqlite DB
+		self.db_path = os.path.join(base, OUTFILE_DB)
+		# ensure DB and tables exist
+		try:
+			self._ensure_db()
+		except Exception as e:
+			ctx.log.warn(f"Could not initialize DB {self.db_path}: {e}")
 
 	def _record(self, data: dict) -> None:
 		try:
@@ -55,13 +90,120 @@ class TwitterSearchInterceptor:
 		except Exception as e:
 			ctx.log.warn(f"Failed to write intercept to {self.outfile}: {e}")
 
-	def _record_extracted(self, data: dict) -> None:
-		"""Persist an extracted tweet object to the extracted JSONL file."""
+	def _ensure_db(self) -> None:
+		"""Create sqlite DB and table if needed."""
+		with closing(sqlite3.connect(self.db_path)) as conn:
+			cur = conn.cursor()
+			# Simple table creation — id_str is the single PRIMARY KEY. No migration logic.
+			cur.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS tweets (
+					id_str TEXT PRIMARY KEY,
+					entryId TEXT,
+					typename TEXT,
+					name TEXT,
+					screen_name TEXT,
+					created_at TEXT,
+					user_base64_id TEXT,
+					is_blue_verified INTEGER,
+					location TEXT,
+					description TEXT,
+					parody_commentary_fan_label TEXT,
+					verified INTEGER,
+					full_text TEXT,
+					is_quote_status INTEGER,
+					lang TEXT,
+					possibly_sensitive INTEGER,
+					possibly_sensitive_editable INTEGER,
+					quote_count INTEGER,
+					reply_count INTEGER,
+					retweet_count INTEGER,
+					retweeted INTEGER,
+					user_id_str TEXT,
+					ts REAL
+				)
+				"""
+			)
+			conn.commit()
+			ctx.log.info(f"Initialized DB at {self.db_path}")
+
+	def _insert_extracted_db(self, data: dict) -> None:
+		"""Insert the extracted tweet object into the sqlite DB."""
+		# map booleans to 1/0 for sqlite
+		def _to_int(val):
+			if val is None:
+				return None
+			if isinstance(val, bool):
+				return 1 if val else 0
+			try:
+				return int(val)
+			except Exception:
+				return None
+
+		# choose id_str primary key only — require presence
+		pk = data.get("id_str")
+		if pk is None:
+			# if we still don't have a primary key, skip storing — we don't want NULL primary keys
+			ctx.log.warn("Skipping insert: no id_str/user_id_str/id/entryId available to use as primary key")
+			return
+
+		params = (
+			pk,
+			data.get("entryId"),
+			data.get("__typename"),
+			data.get("name"),
+			data.get("screen_name"),
+			data.get("created_at"),
+			data.get("id"),
+			_to_int(data.get("is_blue_verified")),
+			json.dumps(data.get("location"), ensure_ascii=False) if data.get("location") is not None else None,
+			data.get("description"),
+			data.get("parody_commentary_fan_label"),
+			_to_int(data.get("verified")),
+			data.get("full_text"),
+			_to_int(data.get("is_quote_status")),
+			data.get("lang"),
+			_to_int(data.get("possibly_sensitive")),
+			_to_int(data.get("possibly_sensitive_editable")),
+			_to_int(data.get("quote_count")),
+			_to_int(data.get("reply_count")),
+			_to_int(data.get("retweet_count")),
+			_to_int(data.get("retweeted")),
+			data.get("user_id_str"),
+			time.time(),
+		)
+
 		try:
-			with open(self.outfile_extracted, "a", encoding="utf-8") as fh:
-				fh.write(json.dumps(data, ensure_ascii=False) + "\n")
+			with closing(sqlite3.connect(self.db_path)) as conn:
+				cur = conn.cursor()
+				changes_before = conn.total_changes
+				cur.execute(
+					"""
+					INSERT OR IGNORE INTO tweets (
+						id_str, entryId, typename, name, screen_name, created_at, user_base64_id,
+						is_blue_verified, location, description, parody_commentary_fan_label,
+						verified, full_text, is_quote_status, lang,
+						possibly_sensitive, possibly_sensitive_editable, quote_count, reply_count,
+						retweet_count, retweeted, user_id_str, ts
+					) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+					""",
+					params,
+				)
+				conn.commit()
+				changes_after = conn.total_changes
+				if changes_after > changes_before:
+					ctx.log.info(f"Inserted tweet id_str={pk} into DB {self.db_path}")
+				else:
+					ctx.log.info(f"Ignored duplicate/no-op for id_str={pk} (DB: {self.db_path})")
 		except Exception as e:
-			ctx.log.warn(f"Failed to write extracted tweet to {self.outfile_extracted}: {e}")
+			ctx.log.warn(f"Failed to insert extracted tweet into DB {self.db_path}: {e}")
+
+	def _record_extracted(self, data: dict) -> None:
+		"""Persist an extracted tweet to the sqlite DB (replaces file-based writer)."""
+		try:
+			self._insert_extracted_db(data)
+		except Exception as e:
+			ctx.log.warn(f"Failed to persist extracted tweet to DB: {e}")
 
 	def _find_first(self, obj, key):
 		"""Recursively search for the first occurrence of key in nested dict/list structures."""
@@ -219,7 +361,20 @@ class TwitterSearchInterceptor:
 		try:
 			if flow.metadata.get("twitter_search_intercept"):
 				record = flow.metadata.get("twitter_search_record", {})
-				resp_body = _safe_decode(flow.response.raw_content)
+				# Prefer mitmproxy's decoded text when available (handles compressed content)
+				resp_body = None
+				try:
+					if hasattr(flow.response, "get_text"):
+						# mitmproxy provides get_text which handles decoding
+						resp_body = flow.response.get_text(strict=False)
+					elif hasattr(flow.response, "text"):
+						resp_body = flow.response.text
+				except Exception:
+					resp_body = None
+
+				if resp_body is None:
+					# fallback to safe decode of raw_content
+					resp_body = _safe_decode(flow.response.raw_content)
 
 				record_resp = {
 					"ts": time.time(),
@@ -247,7 +402,7 @@ class TwitterSearchInterceptor:
 					if parsed is not None:
 						tweets = self._extract_timeline_tweets(parsed)
 						if tweets:
-							# write each extracted tweet object as JSONL to a dedicated output file
+							# persist each extracted tweet into the sqlite DB
 							for t in tweets:
 								self._record_extracted(t)
 
