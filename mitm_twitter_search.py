@@ -7,7 +7,7 @@ Usage:
 This script will:
  - detect requests whose path looks like /i/api/graphql/<id>/SearchTimeline
  - log a short summary to mitmproxy's console
- - write a JSON-lines entry to `mitm_twitter_search_intercepts.jsonl` for every intercepted request+response
+ - parse SearchTimeline responses and persist reduced data into a local SQLite DB (mitm_twitter_search.db)
 
 I'll keep this intentionally simple — we log content and save it for further processing or modification later.
 """
@@ -47,8 +47,6 @@ if TYPE_CHECKING:
 
 
 SEARCH_ENDPOINT_RE = re.compile(r"^/i/api/graphql/[^/]+/SearchTimeline(?:\b|\?)")
-OUTFILE = "mitm_twitter_search_intercepts.jsonl"
-# NOTE: extracted data is persisted into sqlite only; no JSONL extracted file maintained
 OUTFILE_DB = "mitm_twitter_search.db"
 
 
@@ -68,14 +66,16 @@ class TwitterSearchInterceptor:
 	"""A small mitmproxy addon to detect SearchTimeline GraphQL requests to x.com and log them.
 
 	- When a request matches, we record request details, then mark the flow so the response is also saved.
-	- Each intercept is appended to a JSONL file for post-processing.
+	- Intercepts are logged to mitmproxy's console. Extracted tweet fields are persisted to SQLite only.
 	"""
 
 	def __init__(self) -> None:
 		# use script directory so files are written to the repo folder predictably
 		base = os.path.dirname(__file__)
-		self.outfile = os.path.join(base, OUTFILE)
 		# no extracted JSONL produced any more; data is persisted to sqlite DB
+		self.db_path = os.path.join(base, OUTFILE_DB)
+		# no JSONL files are written by default - we only persist to sqlite
+		# DB and logs are located in the addon script directory
 		self.db_path = os.path.join(base, OUTFILE_DB)
 		# ensure DB and tables exist
 		try:
@@ -83,12 +83,10 @@ class TwitterSearchInterceptor:
 		except Exception as e:
 			ctx.log.warn(f"Could not initialize DB {self.db_path}: {e}")
 
+	# Ny: no JSONL intercept writes — we store extracted tweets in sqlite only
 	def _record(self, data: dict) -> None:
-		try:
-			with open(self.outfile, "a", encoding="utf-8") as fh:
-				fh.write(json.dumps(data, ensure_ascii=False) + "\n")
-		except Exception as e:
-			ctx.log.warn(f"Failed to write intercept to {self.outfile}: {e}")
+		"""No-op: intercept JSONL writes have been removed — this method kept for compatibility."""
+		return
 
 	def _ensure_db(self) -> None:
 		"""Create sqlite DB and table if needed."""
@@ -202,8 +200,11 @@ class TwitterSearchInterceptor:
 		"""Persist an extracted tweet to the sqlite DB (replaces file-based writer)."""
 		try:
 			self._insert_extracted_db(data)
+			# only persist to sqlite; no JSONL writing
 		except Exception as e:
 			ctx.log.warn(f"Failed to persist extracted tweet to DB: {e}")
+		# no JSONL writes
+		return
 
 	def _find_first(self, obj, key):
 		"""Recursively search for the first occurrence of key in nested dict/list structures."""
@@ -351,8 +352,7 @@ class TwitterSearchInterceptor:
 				flow.metadata["twitter_search_intercept"] = True
 				flow.metadata["twitter_search_record"] = record
 
-				# persist request-only info now
-				self._record(record)
+				# (no JSONL writing) request-only info not persisted to JSONL
 
 		except Exception as e:
 			ctx.log.error(f"Error in TwitterSearchInterceptor.request: {e}")
@@ -386,9 +386,8 @@ class TwitterSearchInterceptor:
 					"body": resp_body,
 				}
 
-				# Merge into one object for easier processing or write as separate entry
+				# Merge into one object for easier processing
 				combined = {"request": record, "response": record_resp}
-				self._record(combined)
 
 				# Attempt to extract a compact set of Tweet fields the user requested
 				try:
@@ -416,5 +415,10 @@ class TwitterSearchInterceptor:
 
 
 addons = [TwitterSearchInterceptor()]
+
+
+if __name__ == "__main__":
+	print("This file is intended to be used as a mitmproxy addon.")
+	print("Run with: mitmdump -s mitm_twitter_search.py")
 
 
