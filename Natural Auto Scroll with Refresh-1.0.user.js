@@ -4,7 +4,7 @@
 // @version      1.0
 // @description  Human-like auto scrolling with random pauses, upward nudges, and refresh cycles
 // @author       You
-// @match        https://x.com/*
+// @match        *://*.x.com/*
 // @grant        none
 // ==/UserScript==
 
@@ -17,7 +17,7 @@
 
     function randomScrollSession() {
         // Random session length between 25–60 seconds for more natural browsing
-        const sessionLength = randInt(25000, 60000);
+        const sessionLength = randInt(90000, 360000);
         const start = Date.now();
 
         function performBurstScroll() {
@@ -141,6 +141,16 @@
         // Simulate human breaks (snack, toilet, etc.) - occasionally take 5-15 minute pauses
         if (Math.random() < 0.1) { // 10% chance
             delay = randInt(300000, 900000); // 5-15 minutes
+            console.log("Taking a human break (snack, toilet, etc.)...");
+        }
+        // Simulate medium breaks
+        if (Math.random() < 0.1) { // 10% chance
+            delay = randInt(900000, 1200000); // 5-15 minutes
+            console.log("Taking a human break (snack, toilet, etc.)...");
+        }
+        // Simulate large breaks
+        if (Math.random() < 0.1) { // 10% chance
+            delay = randInt(1200000, 2000000); // 5-15 minutes
             console.log("Taking a human break (snack, toilet, etc.)...");
         }
         setTimeout(randomScrollSession, delay);
